@@ -1,46 +1,9 @@
 # ETL_Warehouse_Pipeline
 
-# Pipeline ETL con Modelo Dimensional Kimball para OLAP
-
-Este proyecto implementa un pipeline ETL (Extract, Transform, Load) que procesa un conjunto de datos JSON comprimidos en un archivo ZIP, para transformarlos y cargarlos en una base de datos SQLite con un **modelo dimensional Kimball**, orientado a soportar análisis OLAP (Online Analytical Processing).
-
-## Enfoque Kimball y OLAP
-
-### ¿Qué es el modelo dimensional Kimball?
-
-El modelo dimensional Kimball es una metodología para diseñar almacenes de datos (Data Warehouses) enfocados en facilitar consultas analíticas rápidas y eficientes. Este modelo organiza la información en **hechos** (fact tables) y **dimensiones** (dimensional tables), optimizando el acceso a los datos para análisis multidimensionales.
-
-**Tabla de Hechos (Fact Table)**: Contiene medidas cuantitativas (por ejemplo, montos de transacciones, cantidades, totales) y referencias a las dimensiones.
-**Tablas de Dimensiones (Dimension Tables)**: Contienen atributos descriptivos (por ejemplo, clientes, cuentas, fechas) usados para segmentar y filtrar los datos en análisis.
-
-### ¿Por qué este pipeline ETL es Kimball?
-
-1. **Separación clara de hechos y dimensiones**:
-La tabla `fact_transactions` almacena las transacciones financieras, con métricas como cantidad, monto y totales.
-Las tablas `dim_accounts`, `dim_customers` y `dim_dates` son dimensiones que describen cuentas, clientes y fechas respectivamente.
-La tabla `account_customers` modela la relación entre clientes y cuentas (relación muchos a muchos).
-
-2. **Generación de claves sustitutas**:
-Para mantener integridad y facilitar el análisis, se crean IDs únicos generados internamente para cada dimensión (clientes, cuentas, fechas).
-  
-3. **Desnormalización controlada**:
-Las dimensiones incluyen solo atributos relevantes para análisis, optimizando el rendimiento de las consultas OLAP.
-  
-4. **Preparación para análisis multidimensional**:
-   Con esta estructura, es posible hacer consultas complejas para analizar, por ejemplo:
-   Transacciones por cliente o cuenta.
-   Evolución de montos a lo largo del tiempo.
-   Comportamientos por productos o símbolos.
-
-### ¿Cómo el pipeline soporta OLAP?
-
-**Consultas rápidas y eficientes**: Al usar un esquema dimensional, las consultas de agregación, filtrado y segmentación se vuelven más intuitivas y performantes.
-**Flexibilidad para análisis complejos**: La separación en dimensiones y hechos facilita cruzar diferentes perspectivas (clientes, fechas, productos) para obtener insights profundos.
-**Facilidad de mantenimiento**: La estructura modular permite actualizar dimensiones y hechos de forma independiente, escalando el sistema según nuevas necesidades analíticas.
-
-
-
 ## Descripción del Pipeline ETL
+
+La metodología Kimball fue seleccionada para este proyecto debido a su equilibrio entre simplicidad, rendimiento y facilidad de uso para análisis OLAP. A diferencia del enfoque One Big Table (OBT), que puede simplificar la estructura pero generar tablas enormes y poco manejables, Kimball organiza los datos en dimensiones y hechos, facilitando consultas rápidas y segmentadas. Frente al Data Vault, que es más complejo y enfocado en la integración y trazabilidad para entornos de data warehouse empresariales muy grandes, Kimball ofrece un diseño más accesible y fácil de implementar para proyectos de tamaño mediano y con requisitos analíticos claros. Por otro lado, el modelado normalizado, común en bases de datos transaccionales (OLTP), no es tan eficiente para consultas analíticas, ya que requiere múltiples joins complejos. En resumen, Kimball se eligió por su capacidad para optimizar el rendimiento en análisis multidimensional y su estructura intuitiva para usuarios finales, facilitando la exploración y generación de reportes de manera ágil.
+
 
 ### 1. Extracción (Extract)
 
