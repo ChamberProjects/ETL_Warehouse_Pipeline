@@ -215,8 +215,8 @@ def load_to_sqlite_kimball(dim_accounts, dim_customers, account_customer_mapping
 # Ejecuta
 if __name__ == "__main__":
     # Ruta al archivo ZIP de entrada y a la base de datos
-    zip_path = 'C:/Users/PC/Downloads/sample_analytics_dataset.zip'
-    db_name = 'C:/Users/PC/Desktop/analytics_etl.db'
+    zip_path = ''
+    db_name = ''
 
     # Verificamos que el archivo exista
     if not os.path.isfile(zip_path):
