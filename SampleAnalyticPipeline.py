@@ -1,237 +1,1014 @@
-# Importación de librerías necesarias
-import zipfile  # Para descomprimir archivos .zip
-import json     # Para trabajar con archivos JSON
-import sqlite3  # Para conectarnos a la base de datos SQLite
-import os       # Para validar rutas y archivos
-from datetime import datetime  # Para manejar fechas
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
 
-# Extraer Zip
-def extract_json_from_zip(zip_path):
-    data = {}
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        for file_name in zip_ref.namelist():
-            if file_name.endswith('.json') and '__MACOSX' not in file_name:
-                with zip_ref.open(file_name) as f:
-                    base = os.path.basename(file_name)
-                    # Clasificamos los archivos según su nombre
-                    if base == 'sample_analytics.accounts.json':
-                        data['accounts'] = json.load(f)
-                    elif base == 'sample_analytics.customers.json':
-                        data['customers'] = json.load(f)
-                    elif base == 'sample_analytics.transactions.json':
-                        data['transactions'] = json.load(f)
-    return data['accounts'], data['customers'], data['transactions']
+namespace EtlKimball
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            // Ruta al archivo ZIP
+            string zipPath = "";
 
-# Transformar los datos
-def transform_data(accounts, customers, transactions):
-    dim_accounts = {}
-    for idx, account in enumerate(accounts, start=1):
-        # Creamos IDs propios y extraemos campos relevantes
-        dim_accounts[idx] = (
-            account.get('limit', 0),
-            ','.join(account.get('products', []))
-        )
-        # Guardamos el nuevo ID en el objeto original
-        account['__generated_account_id'] = idx
+            // Ruta de la base de datos SQLite
+            string dbName = "";
 
-    dim_customers = {}
-    account_customer_mapping = []
-    next_customer_id = 1
+            // Verificamos que el archivo exista
+            if (!File.Exists(zipPath))
+            {
+                Console.WriteLine($"Archivo no encontrado: {zipPath}");
+                return;
+            }
 
-    for customer in customers:
-        username = customer.get('username') or f"user{next_customer_id}"
-        birthdate_raw = customer.get('birthdate', '')
-        if isinstance(birthdate_raw, dict):
-            birthdate_raw = birthdate_raw.get('$date', '')
-        try:
-            dt = datetime.fromisoformat(birthdate_raw.replace('Z', ''))
-            birth_date = dt.date().isoformat()
-        except:
-            birth_date = ''
+            Console.WriteLine("Extrayendo datos...");
 
-        # Guardamos cliente con nuevo ID
-        dim_customers[next_customer_id] = {
-            'customer_id': next_customer_id,
-            'name': customer.get('name', ''),
-            'username': username,
-            'birth_date': birth_date,
-            'accounts': customer.get('accounts', [])
+            var (accounts, customers, transactions) =
+                ExtractJsonFromZip(zipPath);
+
+            Console.WriteLine("Transformando datos...");
+
+            var result = TransformData(
+                accounts,
+                customers,
+                transactions
+            );
+
+            Console.WriteLine("Creando tablas...");
+
+            CreateTablesIfNotExist(dbName);
+
+            Console.WriteLine("Cargando datos...");
+
+            LoadToSqliteKimball(
+                result.DimAccounts,
+                result.DimCustomers,
+                result.AccountCustomerMapping,
+                result.DimDates,
+                result.FactTransactions,
+                dbName
+            );
+
+            Console.WriteLine("\nETL completado correctamente.");
         }
-        next_customer_id += 1
 
-    # Mapeamos la relación customer -> account
-    for customer in dim_customers.values():
-        for acc_id in customer['accounts']:
-            matching_account_id = next((a['__generated_account_id'] for a in accounts if a['account_id'] == acc_id), None)
-            if matching_account_id:
-                account_customer_mapping.append((customer['customer_id'], matching_account_id))
 
-    dim_dates = []
-    fact_transactions = []
-    date_ids = {}
-    next_date_id = 1
-    transaction_id = 1
+        // =====================================================
+        // EXTRACT
+        // =====================================================
 
-    for transaction_group in transactions:
-        original_account_id = transaction_group.get('account_id')
-        mapped_account_id = next((a['__generated_account_id'] for a in accounts if a['account_id'] == original_account_id), None)
-        if not mapped_account_id:
-            continue  # Saltar si no se encuentra
+        public static (
+            List<Account>,
+            List<Customer>,
+            List<TransactionGroup>
+        ) ExtractJsonFromZip(string zipPath)
+        {
+            List<Account> accounts = new();
+            List<Customer> customers = new();
+            List<TransactionGroup> transactions = new();
 
-        transaction_count = transaction_group.get('transaction_count', 0)
-        for transaction in transaction_group.get('transactions', []):
-            try:
-                # Convertimos la fecha al formato ISO estándar
-                date_str = transaction['date'].get('$date') if isinstance(transaction['date'], dict) else transaction['date']
-                dt = datetime.fromisoformat(date_str.replace('Z', '')) if date_str else None
-                date_key = dt.date().isoformat() if dt else None
+            using ZipArchive zip =
+                ZipFile.OpenRead(zipPath);
 
-                if not date_key:
-                    continue
+            foreach (ZipArchiveEntry entry in zip.Entries)
+            {
+                string fileName = entry.FullName;
 
-                if date_key not in date_ids:
-                    # Si la fecha no existe aún, la agregamos
-                    date_ids[date_key] = next_date_id
-                    dim_dates.append((next_date_id, date_key))
-                    next_date_id += 1
+                if (!fileName.EndsWith(".json"))
+                    continue;
 
-                # Agregamos registro a la tabla de hechos
-                fact_transactions.append((
-                    transaction_id,
-                    mapped_account_id,
-                    date_ids[date_key],
-                    transaction_count,
-                    transaction.get('amount', 0.0),
-                    transaction.get('transaction_code', ''),
-                    transaction.get('symbol', ''),
-                    float(transaction.get('price', 0.0)),
-                    float(transaction.get('total', 0.0))
-                ))
-                transaction_id += 1
-            except:
-                continue  # Saltar errores
+                if (fileName.Contains("__MACOSX"))
+                    continue;
 
-    return dim_accounts, dim_customers, account_customer_mapping, dim_dates, fact_transactions
+                using Stream stream = entry.Open();
 
-# Crea Tablas
-def create_tables_if_not_exist(db_name):
-    conn = sqlite3.connect(db_name)
-    cur = conn.cursor()
+                string baseName =
+                    Path.GetFileName(fileName);
 
-    # Eliminamos las tablas si ya existen (para evitar duplicación)
-    cur.execute("DROP TABLE IF EXISTS fact_transactions")
-    cur.execute("DROP TABLE IF EXISTS dim_dates")
-    cur.execute("DROP TABLE IF EXISTS account_customers")
-    cur.execute("DROP TABLE IF EXISTS dim_customers")
-    cur.execute("DROP TABLE IF EXISTS dim_accounts")
+                if (baseName ==
+                    "sample_analytics.accounts.json")
+                {
+                    accounts =
+                        JsonSerializer.Deserialize<List<Account>>(
+                            stream
+                        ) ?? new List<Account>();
+                }
+                else if (baseName ==
+                         "sample_analytics.customers.json")
+                {
+                    customers =
+                        JsonSerializer.Deserialize<List<Customer>>(
+                            stream
+                        ) ?? new List<Customer>();
+                }
+                else if (baseName ==
+                         "sample_analytics.transactions.json")
+                {
+                    transactions =
+                        JsonSerializer.Deserialize<
+                            List<TransactionGroup>
+                        >(stream)
+                        ?? new List<TransactionGroup>();
+                }
+            }
 
-    # Creamos tabla de cuentas
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS dim_accounts (
-        account_id INTEGER PRIMARY KEY,
-        limit_amount REAL,
-        products TEXT
+            return (
+                accounts,
+                customers,
+                transactions
+            );
+        }
+
+
+        // =====================================================
+        // TRANSFORM
+        // =====================================================
+
+        public static TransformResult TransformData(
+            List<Account> accounts,
+            List<Customer> customers,
+            List<TransactionGroup> transactions
+        )
+        {
+            var dimAccounts =
+                new Dictionary<int, DimAccount>();
+
+            int generatedAccountId = 1;
+
+            // -------------------------
+            // DIM ACCOUNTS
+            // -------------------------
+
+            foreach (var account in accounts)
+            {
+                dimAccounts[generatedAccountId] =
+                    new DimAccount
+                    {
+                        AccountId =
+                            generatedAccountId,
+
+                        LimitAmount =
+                            account.limit,
+
+                        Products =
+                            string.Join(
+                                ",",
+                                account.products
+                                ?? new List<string>()
+                            )
+                    };
+
+                // Guardamos el ID generado
+                account.GeneratedAccountId =
+                    generatedAccountId;
+
+                generatedAccountId++;
+            }
+
+
+            // -------------------------
+            // DIM CUSTOMERS
+            // -------------------------
+
+            var dimCustomers =
+                new Dictionary<int, DimCustomer>();
+
+            int nextCustomerId = 1;
+
+            foreach (var customer in customers)
+            {
+                string username =
+                    !string.IsNullOrEmpty(
+                        customer.username
+                    )
+                    ? customer.username
+                    : $"user{nextCustomerId}";
+
+                string birthDate = "";
+
+                try
+                {
+                    if (!string.IsNullOrEmpty(
+                        customer.birthdate
+                    ))
+                    {
+                        DateTime dt =
+                            DateTime.Parse(
+                                customer.birthdate,
+                                null,
+                                DateTimeStyles.RoundtripKind
+                            );
+
+                        birthDate =
+                            dt.ToString("yyyy-MM-dd");
+                    }
+                }
+                catch
+                {
+                    birthDate = "";
+                }
+
+
+                dimCustomers[nextCustomerId] =
+                    new DimCustomer
+                    {
+                        CustomerId =
+                            nextCustomerId,
+
+                        Name =
+                            customer.name ?? "",
+
+                        Username =
+                            username,
+
+                        BirthDate =
+                            birthDate,
+
+                        Accounts =
+                            customer.accounts
+                            ?? new List<string>()
+                    };
+
+                nextCustomerId++;
+            }
+
+
+            // -------------------------
+            // CUSTOMER - ACCOUNT
+            // -------------------------
+
+            var accountCustomerMapping =
+                new List<AccountCustomer>();
+
+            foreach (
+                var customer
+                in dimCustomers.Values
+            )
+            {
+                foreach (
+                    string accountId
+                    in customer.Accounts
+                )
+                {
+                    var account =
+                        accounts.FirstOrDefault(
+                            a =>
+                            a.account_id ==
+                            accountId
+                        );
+
+                    if (account != null)
+                    {
+                        accountCustomerMapping.Add(
+                            new AccountCustomer
+                            {
+                                CustomerId =
+                                    customer.CustomerId,
+
+                                AccountId =
+                                    account.GeneratedAccountId
+                            }
+                        );
+                    }
+                }
+            }
+
+
+            // -------------------------
+            // DIM DATES
+            // -------------------------
+
+            var dimDates =
+                new List<DimDate>();
+
+            var dateIds =
+                new Dictionary<string, int>();
+
+            var factTransactions =
+                new List<FactTransaction>();
+
+            int nextDateId = 1;
+
+            int transactionId = 1;
+
+
+            // -------------------------
+            // FACT TRANSACTIONS
+            // -------------------------
+
+            foreach (
+                var transactionGroup
+                in transactions
+            )
+            {
+                string originalAccountId =
+                    transactionGroup.account_id;
+
+                var account =
+                    accounts.FirstOrDefault(
+                        a =>
+                        a.account_id ==
+                        originalAccountId
+                    );
+
+                if (account == null)
+                    continue;
+
+                int mappedAccountId =
+                    account.GeneratedAccountId;
+
+                int transactionCount =
+                    transactionGroup.transaction_count;
+
+
+                foreach (
+                    var transaction
+                    in transactionGroup.transactions
+                )
+                {
+                    try
+                    {
+                        if (
+                            string.IsNullOrEmpty(
+                                transaction.date
+                            )
+                        )
+                            continue;
+
+
+                        DateTime dt =
+                            DateTime.Parse(
+                                transaction.date,
+                                null,
+                                DateTimeStyles.RoundtripKind
+                            );
+
+                        string dateKey =
+                            dt.ToString("yyyy-MM-dd");
+
+
+                        // Si la fecha no existe
+                        if (
+                            !dateIds.ContainsKey(
+                                dateKey
+                            )
+                        )
+                        {
+                            dateIds[dateKey] =
+                                nextDateId;
+
+                            dimDates.Add(
+                                new DimDate
+                                {
+                                    DateId =
+                                        nextDateId,
+
+                                    Date =
+                                        dateKey
+                                }
+                            );
+
+                            nextDateId++;
+                        }
+
+
+                        // Insertamos en FACT
+                        factTransactions.Add(
+                            new FactTransaction
+                            {
+                                TransactionId =
+                                    transactionId,
+
+                                AccountId =
+                                    mappedAccountId,
+
+                                DateId =
+                                    dateIds[dateKey],
+
+                                TransactionCount =
+                                    transactionCount,
+
+                                Amount =
+                                    transaction.amount,
+
+                                TransactionType =
+                                    transaction.transaction_code
+                                    ?? "",
+
+                                Symbol =
+                                    transaction.symbol
+                                    ?? "",
+
+                                Price =
+                                    transaction.price,
+
+                                Total =
+                                    transaction.total
+                            }
+                        );
+
+                        transactionId++;
+                    }
+                    catch
+                    {
+                        // Saltamos errores
+                        continue;
+                    }
+                }
+            }
+
+
+            return new TransformResult
+            {
+                DimAccounts =
+                    dimAccounts,
+
+                DimCustomers =
+                    dimCustomers,
+
+                AccountCustomerMapping =
+                    accountCustomerMapping,
+
+                DimDates =
+                    dimDates,
+
+                FactTransactions =
+                    factTransactions
+            };
+        }
+
+
+        // =====================================================
+        // CREATE TABLES
+        // =====================================================
+
+        public static void CreateTablesIfNotExist(
+            string dbName
+        )
+        {
+            using var connection =
+                new SqliteConnection(
+                    $"Data Source={dbName}"
+                );
+
+            connection.Open();
+
+            string sql = @"
+
+DROP TABLE IF EXISTS fact_transactions;
+DROP TABLE IF EXISTS dim_dates;
+DROP TABLE IF EXISTS account_customers;
+DROP TABLE IF EXISTS dim_customers;
+DROP TABLE IF EXISTS dim_accounts;
+
+
+CREATE TABLE dim_accounts (
+    account_id INTEGER PRIMARY KEY,
+    limit_amount REAL,
+    products TEXT
+);
+
+
+CREATE TABLE dim_customers (
+    customer_id INTEGER PRIMARY KEY,
+    name TEXT,
+    username TEXT,
+    birth_date TEXT
+);
+
+
+CREATE TABLE account_customers (
+    customer_id INTEGER,
+    account_id INTEGER,
+    PRIMARY KEY (
+        customer_id,
+        account_id
     )
-    """)
+);
 
-    # Tabla de clientes
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS dim_customers (
-        customer_id INTEGER PRIMARY KEY,
-        name TEXT,
-        username TEXT,
-        birth_date TEXT
-    )
-    """)
 
-    # Tabla relacional entre clientes y cuentas
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS account_customers (
-        customer_id INTEGER,
-        account_id INTEGER,
-        PRIMARY KEY (customer_id, account_id)
-    )
-    """)
+CREATE TABLE dim_dates (
+    date_id INTEGER PRIMARY KEY,
+    date TEXT
+);
 
-    # Tabla de fechas
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS dim_dates (
-        date_id INTEGER PRIMARY KEY,
-        date TEXT
-    )
-    """)
 
-    # Tabla de hechos con las transacciones
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS fact_transactions (
-        transaction_id INTEGER PRIMARY KEY,
-        account_id INTEGER,
-        date_id INTEGER,
-        transaction_count INTEGER,
-        amount REAL,
-        transaction_type TEXT,
-        symbol TEXT,
-        price REAL,
-        total REAL
-    )
-    """)
+CREATE TABLE fact_transactions (
+    transaction_id INTEGER PRIMARY KEY,
+    account_id INTEGER,
+    date_id INTEGER,
+    transaction_count INTEGER,
+    amount REAL,
+    transaction_type TEXT,
+    symbol TEXT,
+    price REAL,
+    total REAL
+);
 
-    conn.commit()
-    conn.close()
+";
 
-# Carga
-def load_to_sqlite_kimball(dim_accounts, dim_customers, account_customer_mapping, dim_dates, fact_transactions, db_name):
-    conn = sqlite3.connect(db_name)
-    cur = conn.cursor()
+            using var command =
+                connection.CreateCommand();
 
-    # Insertamos los registros transformados a cada tabla
-    cur.executemany("INSERT INTO dim_accounts (account_id, limit_amount, products) VALUES (?, ?, ?)",
-                    [(k, v[0], v[1]) for k, v in dim_accounts.items()])
+            command.CommandText = sql;
 
-    cur.executemany("INSERT INTO dim_customers (customer_id, name, username, birth_date) VALUES (?, ?, ?, ?)",
-                    [(v['customer_id'], v['name'], v['username'], v['birth_date']) for v in dim_customers.values()])
+            command.ExecuteNonQuery();
+        }
 
-    cur.executemany("INSERT INTO account_customers (customer_id, account_id) VALUES (?, ?)", account_customer_mapping)
-    cur.executemany("INSERT INTO dim_dates (date_id, date) VALUES (?, ?)", dim_dates)
 
-    cur.executemany("""
-    INSERT INTO fact_transactions (
-        transaction_id, account_id, date_id, transaction_count,
-        amount, transaction_type, symbol, price, total
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, fact_transactions)
+        // =====================================================
+        // LOAD
+        // =====================================================
 
-    conn.commit()
+        public static void LoadToSqliteKimball(
+            Dictionary<int, DimAccount> dimAccounts,
+            Dictionary<int, DimCustomer> dimCustomers,
+            List<AccountCustomer> accountCustomerMapping,
+            List<DimDate> dimDates,
+            List<FactTransaction> factTransactions,
+            string dbName
+        )
+        {
+            using var connection =
+                new SqliteConnection(
+                    $"Data Source={dbName}"
+                );
 
-    # Mostrar cuántos registros se insertaron en cada tabla
-    print("\nResumen de carga de datos:")
-    for table in ['dim_accounts', 'dim_customers', 'account_customers', 'dim_dates', 'fact_transactions']:
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
-        count = cur.fetchone()[0]
-        print(f"{table}: {count} filas insertadas")
+            connection.Open();
 
-    conn.close()
 
-# Ejecuta
-if __name__ == "__main__":
-    # Ruta al archivo ZIP de entrada y a la base de datos
-    zip_path = ''
-    db_name = ''
+            using var transaction =
+                connection.BeginTransaction();
 
-    # Verificamos que el archivo exista
-    if not os.path.isfile(zip_path):
-        print(f"Archivo no encontrado: {zip_path}")
-    else:
-        print("Extrayendo datos...")
-        accounts, customers, transactions = extract_json_from_zip(zip_path)
 
-        print("Transformando datos...")
-        dim_account, dim_customer, account_client, dim_date, fact_transactions = transform_data(accounts, customers, transactions)
+            // -------------------------
+            // DIM ACCOUNTS
+            // -------------------------
 
-        print("Creando tablas...")
-        create_tables_if_not_exist(db_name)
+            foreach (
+                var account
+                in dimAccounts.Values
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
 
-        print("Cargando datos...")
-        load_to_sqlite_kimball(dim_account, dim_customer, account_client, dim_date, fact_transactions, db_name)
+                command.Transaction =
+                    transaction;
 
-        print("\nETL completado correctamente.")
+                command.CommandText = @"
+INSERT INTO dim_accounts
+(
+    account_id,
+    limit_amount,
+    products
+)
+VALUES
+(
+    @account_id,
+    @limit_amount,
+    @products
+);
+";
+
+                command.Parameters.AddWithValue(
+                    "@account_id",
+                    account.AccountId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@limit_amount",
+                    account.LimitAmount
+                );
+
+                command.Parameters.AddWithValue(
+                    "@products",
+                    account.Products
+                );
+
+                command.ExecuteNonQuery();
+            }
+
+
+            // -------------------------
+            // DIM CUSTOMERS
+            // -------------------------
+
+            foreach (
+                var customer
+                in dimCustomers.Values
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
+
+                command.Transaction =
+                    transaction;
+
+                command.CommandText = @"
+INSERT INTO dim_customers
+(
+    customer_id,
+    name,
+    username,
+    birth_date
+)
+VALUES
+(
+    @customer_id,
+    @name,
+    @username,
+    @birth_date
+);
+";
+
+                command.Parameters.AddWithValue(
+                    "@customer_id",
+                    customer.CustomerId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@name",
+                    customer.Name
+                );
+
+                command.Parameters.AddWithValue(
+                    "@username",
+                    customer.Username
+                );
+
+                command.Parameters.AddWithValue(
+                    "@birth_date",
+                    customer.BirthDate
+                );
+
+                command.ExecuteNonQuery();
+            }
+
+
+            // -------------------------
+            // ACCOUNT CUSTOMERS
+            // -------------------------
+
+            foreach (
+                var mapping
+                in accountCustomerMapping
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
+
+                command.Transaction =
+                    transaction;
+
+                command.CommandText = @"
+INSERT INTO account_customers
+(
+    customer_id,
+    account_id
+)
+VALUES
+(
+    @customer_id,
+    @account_id
+);
+";
+
+                command.Parameters.AddWithValue(
+                    "@customer_id",
+                    mapping.CustomerId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@account_id",
+                    mapping.AccountId
+                );
+
+                command.ExecuteNonQuery();
+            }
+
+
+            // -------------------------
+            // DIM DATES
+            // -------------------------
+
+            foreach (
+                var date
+                in dimDates
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
+
+                command.Transaction =
+                    transaction;
+
+                command.CommandText = @"
+INSERT INTO dim_dates
+(
+    date_id,
+    date
+)
+VALUES
+(
+    @date_id,
+    @date
+);
+";
+
+                command.Parameters.AddWithValue(
+                    "@date_id",
+                    date.DateId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@date",
+                    date.Date
+                );
+
+                command.ExecuteNonQuery();
+            }
+
+
+            // -------------------------
+            // FACT TRANSACTIONS
+            // -------------------------
+
+            foreach (
+                var fact
+                in factTransactions
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
+
+                command.Transaction =
+                    transaction;
+
+                command.CommandText = @"
+INSERT INTO fact_transactions
+(
+    transaction_id,
+    account_id,
+    date_id,
+    transaction_count,
+    amount,
+    transaction_type,
+    symbol,
+    price,
+    total
+)
+VALUES
+(
+    @transaction_id,
+    @account_id,
+    @date_id,
+    @transaction_count,
+    @amount,
+    @transaction_type,
+    @symbol,
+    @price,
+    @total
+);
+";
+
+                command.Parameters.AddWithValue(
+                    "@transaction_id",
+                    fact.TransactionId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@account_id",
+                    fact.AccountId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@date_id",
+                    fact.DateId
+                );
+
+                command.Parameters.AddWithValue(
+                    "@transaction_count",
+                    fact.TransactionCount
+                );
+
+                command.Parameters.AddWithValue(
+                    "@amount",
+                    fact.Amount
+                );
+
+                command.Parameters.AddWithValue(
+                    "@transaction_type",
+                    fact.TransactionType
+                );
+
+                command.Parameters.AddWithValue(
+                    "@symbol",
+                    fact.Symbol
+                );
+
+                command.Parameters.AddWithValue(
+                    "@price",
+                    fact.Price
+                );
+
+                command.Parameters.AddWithValue(
+                    "@total",
+                    fact.Total
+                );
+
+                command.ExecuteNonQuery();
+            }
+
+
+            // Confirmamos transacción
+            transaction.Commit();
+
+
+            // -------------------------
+            // RESUMEN
+            // -------------------------
+
+            Console.WriteLine(
+                "\nResumen de carga de datos:"
+            );
+
+            string[] tables =
+            {
+                "dim_accounts",
+                "dim_customers",
+                "account_customers",
+                "dim_dates",
+                "fact_transactions"
+            };
+
+
+            foreach (
+                string table
+                in tables
+            )
+            {
+                using var command =
+                    connection.CreateCommand();
+
+                command.CommandText =
+                    $"SELECT COUNT(*) FROM {table}";
+
+                long count =
+                    (long)command.ExecuteScalar();
+
+                Console.WriteLine(
+                    $"{table}: {count} filas insertadas"
+                );
+            }
+        }
+    }
+
+
+    // =====================================================
+    // MODELOS
+    // =====================================================
+
+    public class Account
+    {
+        public string account_id { get; set; }
+
+        public double limit { get; set; }
+
+        public List<string> products { get; set; }
+
+        public int GeneratedAccountId { get; set; }
+    }
+
+
+    public class Customer
+    {
+        public string name { get; set; }
+
+        public string username { get; set; }
+
+        public string birthdate { get; set; }
+
+        public List<string> accounts { get; set; }
+    }
+
+
+    public class TransactionGroup
+    {
+        public string account_id { get; set; }
+
+        public int transaction_count { get; set; }
+
+        public List<TransactionData> transactions { get; set; }
+    }
+
+
+    public class TransactionData
+    {
+        public string date { get; set; }
+
+        public double amount { get; set; }
+
+        public string transaction_code { get; set; }
+
+        public string symbol { get; set; }
+
+        public double price { get; set; }
+
+        public double total { get; set; }
+    }
+
+
+    // =====================================================
+    // DIMENSIONES
+    // =====================================================
+
+    public class DimAccount
+    {
+        public int AccountId { get; set; }
+
+        public double LimitAmount { get; set; }
+
+        public string Products { get; set; }
+    }
+
+
+    public class DimCustomer
+    {
+        public int CustomerId { get; set; }
+
+        public string Name { get; set; }
+
+        public string Username { get; set; }
+
+        public string BirthDate { get; set; }
+
+        public List<string> Accounts { get; set; }
+    }
+
+
+    public class AccountCustomer
+    {
+        public int CustomerId { get; set; }
+
+        public int AccountId { get; set; }
+    }
+
+
+    public class DimDate
+    {
+        public int DateId { get; set; }
+
+        public string Date { get; set; }
+    }
+
+
+    public class FactTransaction
+    {
+        public int TransactionId { get; set; }
+
+        public int AccountId { get; set; }
+
+        public int DateId { get; set; }
+
+        public int TransactionCount { get; set; }
+
+        public double Amount { get; set; }
+
+        public string TransactionType { get; set; }
+
+        public string Symbol { get; set; }
+
+        public double Price { get; set; }
+
+        public double Total { get; set; }
+    }
+
+
+    // =====================================================
+    // RESULTADO DE TRANSFORM
+    // =====================================================
+
+    public class TransformResult
+    {
+        public Dictionary<int, DimAccount>
+            DimAccounts { get; set; }
+
+        public Dictionary<int, DimCustomer>
+            DimCustomers { get; set; }
+
+        public List<AccountCustomer>
+            AccountCustomerMapping { get; set; }
+
+        public List<DimDate>
+            DimDates { get; set; }
+
+        public List<FactTransaction>
+            FactTransactions { get; set; }
+    }
+}
